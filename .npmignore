@@ -1,3 +1,5 @@
-*.ts
+src/
+gen/*.ts
 makefile
 tsconfig.json
+test/
