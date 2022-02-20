@@ -78,9 +78,14 @@ export function internalErrorWith(otherErr: Error): TwirpError {
   return twerr.withMeta("cause", otherErr.name);
 }
 
-export function writeTwirpError(e: Error): Response {
+export function writeTwirpError(e: any): Response {
   if (!(e instanceof TwirpError)) {
-    e = internalErrorWith(e);
+    if (e instanceof Error) {
+      e = internalErrorWith(e);
+    } else {
+      const te = new TwirpError(ErrorCode.Unknown, `unknown error: ${e}`);
+      e = te;
+    }
   }
   const statusCode = serverHTTPStatusFromErrorCode((e as TwirpError).errorCode);
   const respBody = JSON.stringify(e);

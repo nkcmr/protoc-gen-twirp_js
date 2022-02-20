@@ -162,13 +162,15 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
 
   const sc = new SourceCode();
   const typeSc = new SourceCode();
+  const runtimeImports =
+    "badRouteError, parseTwirpPath, decodeRequest, setRequestDetails, encodeResponse, writeTwirpError";
   if (options.moduleSystem === "commonjs") {
     const importPb = `const { ${[...rootsToImport.values()].join(
       ", "
     )} } = require('./${pbjsFileName.replace(/\.js$/i, "")}');`;
     sc.push(
       importPb,
-      `const { badRouteError, parseTwirpPath, decodeRequest, setRequestDetails } = require('@nkcmr/protoc-gen-twirp_js');`,
+      `const { ${runtimeImports} } = require('@nkcmr/protoc-gen-twirp_js');`,
       ""
     );
     typeSc.push(importPb);
@@ -178,7 +180,7 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
     )} } from './${pbjsFileName.replace(/\.js$/i, "")}';`;
     sc.push(
       importPb,
-      `import { badRouteError, parseTwirpPath, decodeRequest, setRequestDetails } from '@nkcmr/protoc-gen-twirp_js';`,
+      `import { ${runtimeImports} } from '@nkcmr/protoc-gen-twirp_js';`,
       ""
     );
     typeSc.push(importPb);
