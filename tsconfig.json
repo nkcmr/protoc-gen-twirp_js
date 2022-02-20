@@ -1,0 +1,11 @@
+{
+  "include": ["src/**/*"],
+  "buildOptions": {},
+  "compilerOptions": {
+    "strict": true,
+    "outDir": "dist",
+    "declaration": true,
+    "target": "ES6",
+    "moduleResolution": "node"
+  }
+}

@@ -1,3 +1,7 @@
+dist/index.js dist/index.d.ts: $(wildcard src/*) node_modules/.package-lock.json
+	mkdir -p $(dir $@)
+	./node_modules/.bin/tsc
+
 src/plugin.pb.js: node_modules/.package-lock.json
 	mkdir -p $(dir $@)
 	./node_modules/.bin/pbjs \

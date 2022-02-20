@@ -1,8 +1,12 @@
 const fs = require("fs");
 const { main: protobufjsmain } = require("protobufjs/cli/pbjs");
 const { main: protobuftsmain } = require("protobufjs/cli/pbts");
+const tmp = require("tmp");
 const { google } = require("./plugin.pb");
 const prettier = require("prettier");
+const { promisify } = require("util");
+
+const writeFile = promisify(fs.writeFile);
 
 const { CodeGeneratorRequest, CodeGeneratorResponse } =
   google.protobuf.compiler;
@@ -52,12 +56,42 @@ function debug(message, v = {}) {
 }
 
 /**
+ * @returns {Promise<any>}
+ */
+function tmpfile(work) {
+  return new Promise((resolve, reject) => {
+    tmp.file(async (err, path, fd, cleanupCallback) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      const result = await work(path);
+      cleanupCallback();
+      resolve(result);
+    });
+  });
+}
+
+/**
  * @param {string[]} args
  * @returns {Promise<string>}
  */
 function protobufjs(args) {
   return new Promise((resolve, reject) => {
     protobufjsmain(args, (err, output) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(output);
+    });
+  });
+}
+
+function protobufts(args) {
+  return new Promise((resolve, reject) => {
+    protobuftsmain(args, (err, output) => {
+      debug("protobufts output", { err, output });
       if (err) {
         reject(err);
         return;
@@ -111,7 +145,7 @@ class SourceCode extends Array {
  * @param {string} pbjsFileName
  * @returns {Promise<google.protobuf.compiler.CodeGeneratorResponse.File[]>}
  */
-async function genTwirpCFServer(request, pbjsFileName) {
+async function genTwirpCFServer(request, pbjsFileName, options) {
   /** @type {Set<string>} */
   const rootsToImport = new Set();
   for (let pf of request.proto_file) {
@@ -127,22 +161,35 @@ async function genTwirpCFServer(request, pbjsFileName) {
   }
 
   const sc = new SourceCode();
-  sc.push(
-    `const { ${[...rootsToImport.values()].join(
+  const typeSc = new SourceCode();
+  if (options.moduleSystem === "commonjs") {
+    const importPb = `const { ${[...rootsToImport.values()].join(
       ", "
-    )} } = require('./${pbjsFileName.replace(/\.js$/i, "")}');`,
-    `const { badRouteError, parseTwirpPath, decodeRequest, setRequestDetails } = require('@nkcmr/protoc-gen-twirp_js');`,
-    ""
-  );
+    )} } = require('./${pbjsFileName.replace(/\.js$/i, "")}');`;
+    sc.push(
+      importPb,
+      `const { badRouteError, parseTwirpPath, decodeRequest, setRequestDetails } = require('@nkcmr/protoc-gen-twirp_js');`,
+      ""
+    );
+    typeSc.push(importPb);
+  } else if (options.moduleSystem === "es6") {
+    const importPb = `import { ${[...rootsToImport.values()].join(
+      ", "
+    )} } from './${pbjsFileName.replace(/\.js$/i, "")}';`;
+    sc.push(
+      importPb,
+      `import { badRouteError, parseTwirpPath, decodeRequest, setRequestDetails } from '@nkcmr/protoc-gen-twirp_js';`,
+      ""
+    );
+    typeSc.push(importPb);
+  } else {
+    throw new Error(`unknown module system: ${options.moduleSystem}`);
+  }
 
   for (let pf of request.proto_file) {
     for (let svc of pf.service) {
+      typeSc.push(`export interface I${svc.name}Handler {`);
       sc.write(function* () {
-        yield `/**`;
-        yield ` * @param {Request} request`;
-        yield ` * @param {*} handler`;
-        yield ` * @returns {Promise<Response>}`;
-        yield ` */`;
         yield `export async function handle${svc.name}Server(request, handler) {`;
         sc.write(function* () {
           sc.tryCatch({
@@ -183,15 +230,19 @@ async function genTwirpCFServer(request, pbjsFileName) {
                 yield `);`;
               });
               yield `}`;
-              yield `const contentType = request.headers.get('Content-Type').split(';').pop();`;
               yield "";
               yield `switch (method) {`;
               for (let i = 0; i < svc.method.length; i++) {
                 const m = svc.method[i];
+                const input = m.input_type.slice(1);
+                const output = m.output_type.slice(1);
+                typeSc.write(function* () {
+                  yield `${m.name}(request: ${input}): Promise<${output}>`;
+                });
                 sc.write(function* () {
                   yield `case "${m.name}":`;
                   sc.write(function* () {
-                    yield `const request${i} = decodeRequest(contentType, await request.arrayBuffer(), ${m.input_type.slice(1)})`;
+                    yield `const [request${i}, ct${i}] = await decodeRequest(request, ${input})`;
                     yield `setRequestDetails(request${i}, {`;
                     sc.write(function* () {
                       yield `headers: request.headers,`;
@@ -201,10 +252,11 @@ async function genTwirpCFServer(request, pbjsFileName) {
                       1
                     )}} response${i} */`;
                     yield `const response${i} = await handler.${m.name}(request${i});`;
-                    yield `return encodeResponse(contentType, response${i}, ${m.output_type.slice(1)})`;
+                    yield `return encodeResponse(ct${i}, response${i}, ${output})`;
                   });
                 });
               }
+              typeSc.push("}", "");
               yield `}`;
               yield "badRouteError(";
               sc.write(function* () {
@@ -221,16 +273,31 @@ async function genTwirpCFServer(request, pbjsFileName) {
         });
         yield `}`;
       });
+      typeSc.push(
+        `export function handle${svc.name}Server(request: Request, handler: I${svc.name}Handler): Promise<Response>;`
+      );
     }
   }
-
-  return {
+  const twirpJSFile = {
     name: `${commonPackagePrefix(request)}.twirp.js`,
     content: prettier.format([...sc, ""].join("\n"), {
       filepath: process.cwd(),
       parser: "babel",
     }),
   };
+  if (!options.emitTypes) {
+    return [twirpJSFile];
+  }
+  return [
+    twirpJSFile,
+    {
+      name: `${commonPackagePrefix(request)}.twirp.d.ts`,
+      content: prettier.format([...typeSc, ""].join("\n"), {
+        filepath: process.cwd(),
+        parser: "babel-ts",
+      }),
+    },
+  ];
 }
 
 /**
@@ -284,30 +351,47 @@ async function main(request) {
     .map((p) => p.split("="))
     .reduce((p, c) => ({ ...p, [c[0]]: c[1] }), {});
 
+  const options = {
+    emitTypes: !parameters["no_emit_types"],
+    moduleSystem: parameters["module"] ?? "es6",
+  };
+  if (["es6", "commonjs"].includes(options.moduleSystem) === false) {
+    throw new Error(
+      `invalid option: expected "es6" or "commonjs" for "module" option, got "${moduleSystem}"`
+    );
+  }
+
   await debug("params", { parameters });
 
-  const [outputName, protoFiles] = (() => {
+  const [outputName, dtsOutputName, protoFiles] = (() => {
     if (parameters["pb_js_name"]) {
-      return [`${parameters["pb_js_name"]}.pb.js`, request.file_to_generate];
-    }
-    if (request.file_to_generate.length > 1) {
       return [
-        `${commonPackagePrefix(request)}.pb.js`,
+        `${parameters["pb_js_name"]}.pb.js`,
+        `${parameters["pb_js_name"]}.pb.d.ts`,
         request.file_to_generate,
       ];
+    }
+    if (request.file_to_generate.length > 1) {
+      const p = commonPackagePrefix(request);
+      return [`${p}.pb.js`, `${p}.pb.d.ts`, request.file_to_generate];
     } else {
       const protoFile = request.file_to_generate[0];
       const pbjsFileName = protoFile.replace(/\.proto$/i, ".pb.js");
-      return [pbjsFileName, request.file_to_generate];
+      const pbtsFileName = protoFile.replace(/\.proto$/i, ".pb.d.ts");
+      return [pbjsFileName, pbtsFileName, request.file_to_generate];
     }
   })();
+
+  /** @type {google.protobuf.compiler.CodeGeneratorResponse.File[]} */
+  const files = [];
 
   const pbjsFileContents = prettier.format(
     await protobufjs([
       "-t",
       "static-module",
       "-w",
-      "commonjs",
+      options.moduleSystem,
+      "--es6",
       "--no-service",
       "--force-number",
       "--force-message",
@@ -321,14 +405,31 @@ async function main(request) {
     }
   );
 
-  const response = google.protobuf.compiler.CodeGeneratorResponse.create({});
-  response.file.push(
-    {
-      name: outputName,
-      content: pbjsFileContents,
-    },
-    await genTwirpCFServer(request, outputName)
-  );
+  files.push({ name: outputName, content: pbjsFileContents });
+
+  if (options.emitTypes) {
+    // pbts only accepts files as an argument, so we have to write the pbjs file
+    // contents to a temporary file and
+    const pbtsFileContents = await tmpfile(async (path) => {
+      const jsPath = `${path}.js`;
+      await writeFile(jsPath, pbjsFileContents);
+      const pbtsContents = await protobufts([jsPath]);
+      return prettier.format(pbtsContents, {
+        filepath: process.cwd(),
+        parser: "babel-ts",
+      });
+    });
+    files.push({
+      name: dtsOutputName,
+      content: pbtsFileContents,
+    });
+  }
+
+  files.push(...(await genTwirpCFServer(request, outputName, options)));
+
+  const response = google.protobuf.compiler.CodeGeneratorResponse.create({
+    file: files,
+  });
 
   return response;
 }
@@ -349,7 +450,9 @@ function outputResponse(response) {
     const response = await main(request);
     outputResponse(response);
   } catch (e) {
-    const errResponse = CodeGeneratorResponse.create({ error: `${e}` });
+    const errResponse = CodeGeneratorResponse.create({
+      error: `${e}\n${e.stack}`,
+    });
     outputResponse(errResponse);
   }
 })();

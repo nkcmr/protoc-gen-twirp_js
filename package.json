@@ -1,9 +1,9 @@
 {
   "name": "@nkcmr/protoc-gen-twirp_js",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "",
   "private": false,
-  "main": "src/index.js",
+  "main": "dist/index.js",
   "bin": {
     "protoc-gen-twirp_js": "bin/gen.js"
   },
@@ -14,6 +14,10 @@
   "dependencies": {
     "google-proto-files": "^2.5.0",
     "prettier": "^2.5.1",
-    "protobufjs": "^6.11.2"
+    "protobufjs": "^6.11.2",
+    "tmp": "^0.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^4.5.5"
   }
 }
