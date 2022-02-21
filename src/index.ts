@@ -59,7 +59,7 @@ export function badRouteError(msg: string, method: string, url: string): never {
 }
 
 export function parseTwirpPath(path: string): [string, string, string] {
-  const parts = path.split("/");
+  const parts = path.split("/").slice(1 /** skip the first "/" */);
   if (parts.length < 2) {
     return ["", "", ""];
   }
