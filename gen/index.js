@@ -549,7 +549,7 @@ async function main(request) {
   const options = {
     emitTypes: !parameters["no_emit_types"],
     moduleSystem: parameters["module"] ?? "es6",
-    gen: new Set((parameters["gen"] ?? "proto;server;client").split(";")),
+    gen: new Set((parameters["gen"] ?? "proto|server|client").split("|")),
   };
   if (["es6", "commonjs"].includes(options.moduleSystem) === false) {
     throw new Error(
