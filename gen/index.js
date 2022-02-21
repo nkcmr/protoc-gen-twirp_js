@@ -111,7 +111,7 @@ class SourceCode extends Array {
   }
   /**
    * @param {number} level
-   * @param {Generator<string, string, string>} fn
+   * @param {(...args: any) => IterableIterator<string>} fn
    */
   write(fn, ...args) {
     this.level += 1;
@@ -121,6 +121,9 @@ class SourceCode extends Array {
     this.level -= 1;
   }
 
+  /**
+   * @param {...string} lines
+   */
   push(...lines) {
     for (let line of lines) {
       super.push(`${"  ".repeat(this.level)}${line}`);
@@ -141,14 +144,36 @@ class SourceCode extends Array {
 }
 
 /**
+ * Ensures files being iterated over are only the ones being generated and not
+ * dependencies.
+ *
  * @param {google.protobuf.compiler.CodeGeneratorRequest} request
- * @param {string} pbjsFileName
+ * @returns {IterableIterator<google.protobuf.FileDescriptorProto>}
+ */
+function* iterFtg(request) {
+  /** @type {Set<string>} */
+  const ftg = new Set();
+  for (let f of request.file_to_generate) {
+    ftg.add(f);
+  }
+  for (let pf of request.proto_file) {
+    if (!ftg.has(pf.name)) {
+      continue;
+    }
+    yield pf;
+  }
+}
+
+/**
+ * @param {google.protobuf.compiler.CodeGeneratorRequest} request
+ * @param {string} basename
+ * @param {GenOptions} options
  * @returns {Promise<google.protobuf.compiler.CodeGeneratorResponse.File[]>}
  */
-async function genTwirpCFServer(request, pbjsFileName, options) {
+async function genTwirpCFServer(request, basename, options) {
   /** @type {Set<string>} */
   const rootsToImport = new Set();
-  for (let pf of request.proto_file) {
+  for (let pf of iterFtg(request)) {
     for (let svc of pf.service) {
       for (let m of svc.method) {
         if (m.client_streaming || m.server_streaming) {
@@ -162,56 +187,236 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
 
   const sc = new SourceCode();
   const typeSc = new SourceCode();
-  const runtimeImports =
-    "badRouteError, parseTwirpPath, decodeRequest, setRequestDetails, encodeResponse, writeTwirpError";
+  const runtimeImports = [
+    "badRouteError",
+    "parseTwirpPath",
+    "decodeRequest",
+    "setRequestDetails",
+    "encodeResponse",
+    "writeTwirpError",
+    "encodeRequest",
+    "errorFromResponse",
+    "decodeResponse",
+    "TwirpRequestOptions",
+  ].join(", ");
   if (options.moduleSystem === "commonjs") {
     const importPb = `const { ${[...rootsToImport.values()].join(
       ", "
-    )} } = require('./${pbjsFileName.replace(/\.js$/i, "")}');`;
+    )} } = require('./${basename}.pb');`;
     sc.push(
       importPb,
       `const { ${runtimeImports} } = require('@nkcmr/protoc-gen-twirp_js');`,
       ""
     );
     typeSc.push(importPb);
+    if (options.gen.has("client")) {
+      typeSc.push(
+        `const { TwirpRequestOptions } = require('@nkcmr/protoc-gen-twirp_js')`
+      );
+    }
   } else if (options.moduleSystem === "es6") {
     const importPb = `import { ${[...rootsToImport.values()].join(
       ", "
-    )} } from './${pbjsFileName.replace(/\.js$/i, "")}';`;
+    )} } from './${basename}.pb';`;
     sc.push(
       importPb,
       `import { ${runtimeImports} } from '@nkcmr/protoc-gen-twirp_js';`,
       ""
     );
     typeSc.push(importPb);
+    if (options.gen.has("client")) {
+      typeSc.push(
+        `import { TwirpRequestOptions } from '@nkcmr/protoc-gen-twirp_js'`
+      );
+    }
   } else {
     throw new Error(`unknown module system: ${options.moduleSystem}`);
   }
 
-  for (let pf of request.proto_file) {
+  for (let pf of iterFtg(request)) {
     for (let svc of pf.service) {
-      typeSc.push(`export interface I${svc.name}Handler {`);
-      sc.write(function* () {
-        yield `export async function handle${svc.name}Server(request, handler) {`;
+      // client
+      if (options.gen.has("client")) {
+        for (let [name, ct] of [
+          ["JSON", "application/json"],
+          ["Protobuf", "application/protobuf"],
+        ]) {
+          for (let m of svc.method) {
+            const input = m.input_type.slice(1);
+            const output = m.output_type.slice(1);
+            typeSc.push(
+              `export function send${svc.name}${name}Request(method: "${m.name}", request: ${input}, options: Omit<TwirpRequestOptions, 'contentType'>): Promise<${output}>;`
+            );
+          }
+        }
+      }
+      typeSc.push("");
+      // server
+      if (options.gen.has("server")) {
+        typeSc.push(`export interface I${svc.name}Handler {`);
+        typeSc.write(function* () {
+          yield `prefix?: string;`;
+        });
+        for (let m of svc.method) {
+          const input = m.input_type.slice(1);
+          const output = m.output_type.slice(1);
+          typeSc.write(function* () {
+            yield `${m.name}(request: ${input}): Promise<${output}>`;
+          });
+        }
+        typeSc.push("}", "");
+        typeSc.push(
+          `export function handle${svc.name}Server(request: Request, handler: I${svc.name}Handler): Promise<Response>;`
+        );
+      }
+    }
+  }
+
+  for (let pf of iterFtg(request)) {
+    for (let svc of pf.service) {
+      // client
+      if (options.gen.has("client")) {
         sc.write(function* () {
-          sc.tryCatch({
-            *tryBlock() {
-              yield `const u = new URL(request.url);`;
-              yield `if (request.method !== "POST") {`;
-              sc.write(function* () {
-                yield "badRouteError(";
+          yield `export function send${svc.name}JSONRequest(method, request, options) {`;
+          sc.write(function* () {
+            yield `return send${svc.name}Request(method, request, { ...options, contentType: "application/json" })`;
+          });
+          yield `}`;
+          yield `export function send${svc.name}ProtobufRequest(method, request, options) {`;
+          sc.write(function* () {
+            yield `return send${svc.name}Request(method, request, { ...options, contentType: "application/protobuf" })`;
+          });
+          yield `}`;
+          yield `async function send${svc.name}Request(method, request, options) {`;
+          sc.write(function* () {
+            yield "const path = `/${encodeURIComponent(options.prefix) || 'twirp'}/" +
+              pf.package +
+              "." +
+              svc.name +
+              "/${method}`";
+            yield `let u = path;`;
+            yield `if (options.endpoint) {`;
+            sc.write(function* () {
+              yield `const epurl = new URL(options.endpoint);`;
+              yield `epurl.pathname = path;`;
+              yield `epurl.search = '';`;
+              yield `epurl.hash = '';`;
+              yield `u = epurl.toString();`;
+            });
+            yield `}`;
+            yield `/** @type {typeof fetch} */`;
+            yield `const fetcher = options.fetcher || globalThis.fetch;`;
+            yield `switch (method) {`;
+            sc.write(function* () {
+              for (let i = 0; i < svc.method.length; i++) {
+                const m = svc.method[i];
+                const input = m.input_type.slice(1);
+                const output = m.output_type.slice(1);
+                yield `case "${m.name}":`;
                 sc.write(function* () {
-                  yield "`unsupported method ${request.method} (only POST is allowed)`,";
-                  yield `request.method,`;
-                  yield `u.pathname`;
+                  yield `const [body${i}, headers${i}] = encodeRequest(options.contentType, request, ${input})`;
+                  yield `headers${i}.set("Accept", options.contentType);`;
+                  yield `headers${i}.set("Twirp-Version", "v8.1.1");`; // TODO: verify?
+                  yield `const req${i} = new Request(body${i}, {`;
+                  sc.write(function* () {
+                    yield `url: u,`;
+                    yield `method: "POST",`;
+                    yield `headers: headers${i},`;
+                  });
+                  yield `});`;
+                  yield `const res${i} = await fetcher(req${i})`;
+                  yield `const resBody${i} = await res${i}.arrayBuffer();`;
+                  yield `if (res${i}.status !== 200) {`;
+                  sc.write(function* () {
+                    yield `errorFromResponse(res${i}, resBody${i});`;
+                  });
+                  yield `}`;
+                  yield `return decodeResponse(options.contentType, resBody${i}, ${output})`;
                 });
-                yield `);`;
-              });
-              yield `}`;
-              yield "// Verify path format: [<prefix>]/<package>.<Service>/<Method>";
-              yield `const [prefix, pkgService, method] = parseTwirpPath(u.pathname);`;
-              yield `if (pkgService !== "${pf.package}.${svc.name}") {`;
-              sc.write(function* () {
+              }
+            });
+            yield `}`;
+            yield "badRouteError(";
+            sc.write(function* () {
+              yield "`no handler for path ${path}`,";
+              yield `"POST",`;
+              yield `path,`;
+            });
+            yield `);`;
+          });
+
+          yield `}`;
+        });
+      }
+
+      // server
+      if (options.gen.has("server")) {
+        sc.write(function* () {
+          yield `export async function handle${svc.name}Server(request, handler) {`;
+          sc.write(function* () {
+            sc.tryCatch({
+              *tryBlock() {
+                yield `const u = new URL(request.url);`;
+                yield `if (request.method !== "POST") {`;
+                sc.write(function* () {
+                  yield "badRouteError(";
+                  sc.write(function* () {
+                    yield "`unsupported method ${request.method} (only POST is allowed)`,";
+                    yield `request.method,`;
+                    yield `u.pathname`;
+                  });
+                  yield `);`;
+                });
+                yield `}`;
+                yield "// Verify path format: [<prefix>]/<package>.<Service>/<Method>";
+                yield `const [prefix, pkgService, method] = parseTwirpPath(u.pathname);`;
+                yield `if (pkgService !== "${pf.package}.${svc.name}") {`;
+                sc.write(function* () {
+                  yield "badRouteError(";
+                  sc.write(function* () {
+                    yield "`no handler for path ${u.pathname}`,";
+                    yield `request.method,`;
+                    yield `u.pathname`;
+                  });
+                  yield `);`;
+                });
+                yield `}`;
+                yield `const expPrefix = handler.prefix || "twirp";`;
+                yield `if (prefix !== expPrefix) {`;
+                sc.write(function* () {
+                  yield "badRouteError(";
+                  sc.write(function* () {
+                    yield "`invalid path prefix ${prefix}, expected ${expPrefix}, on path ${u.pathname}`,";
+                    yield `request.method,`;
+                    yield `u.pathname`;
+                  });
+                  yield `);`;
+                });
+                yield `}`;
+                yield "";
+                yield `switch (method) {`;
+                for (let i = 0; i < svc.method.length; i++) {
+                  const m = svc.method[i];
+                  const input = m.input_type.slice(1);
+                  const output = m.output_type.slice(1);
+                  sc.write(function* () {
+                    yield `case "${m.name}":`;
+                    sc.write(function* () {
+                      yield `const [request${i}, ct${i}] = await decodeRequest(request, ${input})`;
+                      yield `setRequestDetails(request${i}, {`;
+                      sc.write(function* () {
+                        yield `headers: request.headers,`;
+                      });
+                      yield `});`;
+                      yield `/** @type {${m.output_type.slice(
+                        1
+                      )}} response${i} */`;
+                      yield `const response${i} = await handler.${m.name}(request${i});`;
+                      yield `return encodeResponse(ct${i}, response${i}, ${output})`;
+                    });
+                  });
+                }
+                yield `}`;
                 yield "badRouteError(";
                 sc.write(function* () {
                   yield "`no handler for path ${u.pathname}`,";
@@ -219,69 +424,19 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
                   yield `u.pathname`;
                 });
                 yield `);`;
-              });
-              yield `}`;
-              yield `if (prefix !== "twirp") {`;
-              sc.write(function* () {
-                yield "badRouteError(";
-                sc.write(function* () {
-                  yield "`invalid path prefix ${prefix}, expected twirp, on path ${u.pathname}`,";
-                  yield `request.method,`;
-                  yield `u.pathname`;
-                });
-                yield `);`;
-              });
-              yield `}`;
-              yield "";
-              yield `switch (method) {`;
-              for (let i = 0; i < svc.method.length; i++) {
-                const m = svc.method[i];
-                const input = m.input_type.slice(1);
-                const output = m.output_type.slice(1);
-                typeSc.write(function* () {
-                  yield `${m.name}(request: ${input}): Promise<${output}>`;
-                });
-                sc.write(function* () {
-                  yield `case "${m.name}":`;
-                  sc.write(function* () {
-                    yield `const [request${i}, ct${i}] = await decodeRequest(request, ${input})`;
-                    yield `setRequestDetails(request${i}, {`;
-                    sc.write(function* () {
-                      yield `headers: request.headers,`;
-                    });
-                    yield `});`;
-                    yield `/** @type {${m.output_type.slice(
-                      1
-                    )}} response${i} */`;
-                    yield `const response${i} = await handler.${m.name}(request${i});`;
-                    yield `return encodeResponse(ct${i}, response${i}, ${output})`;
-                  });
-                });
-              }
-              typeSc.push("}", "");
-              yield `}`;
-              yield "badRouteError(";
-              sc.write(function* () {
-                yield "`no handler for path ${u.pathname}`,";
-                yield `request.method,`;
-                yield `u.pathname`;
-              });
-              yield `);`;
-            },
-            *catchBlock(eIdent) {
-              yield `return writeTwirpError(${eIdent})`;
-            },
+              },
+              *catchBlock(eIdent) {
+                yield `return writeTwirpError(${eIdent})`;
+              },
+            });
           });
+          yield `}`;
         });
-        yield `}`;
-      });
-      typeSc.push(
-        `export function handle${svc.name}Server(request: Request, handler: I${svc.name}Handler): Promise<Response>;`
-      );
+      }
     }
   }
   const twirpJSFile = {
-    name: `${commonPackagePrefix(request)}.twirp.js`,
+    name: `${basename}.twirp.js`,
     content: prettier.format([...sc, ""].join("\n"), {
       filepath: process.cwd(),
       parser: "babel",
@@ -293,7 +448,7 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
   return [
     twirpJSFile,
     {
-      name: `${commonPackagePrefix(request)}.twirp.d.ts`,
+      name: `${basename}.twirp.d.ts`,
       content: prettier.format([...typeSc, ""].join("\n"), {
         filepath: process.cwd(),
         parser: "babel-ts",
@@ -303,11 +458,19 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
 }
 
 /**
+ * @param {string} str
+ * @returns {number}
+ */
+const countDots = (str) =>
+  str.split("").reduce((m, c) => (c === "." ? m + 1 : m), 0);
+
+/**
  * commonPackagePrefix will find the lengthiest common package prefix among all
  * input protobuf files. So out of:
  *
  * - example.foo.bar.beep
  * - example.foo.boop
+ * - google.protobuf
  *
  * This function will return "example.foo"
  *
@@ -315,30 +478,59 @@ async function genTwirpCFServer(request, pbjsFileName, options) {
  * @returns {string}
  */
 function commonPackagePrefix(request) {
-  /** @type {Record<string, number>} */
-  const pkgpartsCount = {};
+  /** @type {Set<string>} */
+  const ftg = new Set();
+  for (let f of request.file_to_generate) {
+    ftg.add(f);
+  }
+  /** @type {Map<string, number>} */
+  const pkgpartsCount = new Map(); // using Map due to them remembering insertion order
   for (let pf of request.proto_file) {
+    if (!pf.package || !ftg.has(pf.name)) {
+      continue;
+    }
     const pkgparts = pf.package.split(".");
-    for (let i = 0; i < pkgparts.length; i++) {
+    for (let i = pkgparts.length - 1; i >= 0; i--) {
       const s = pkgparts.slice(0, i + 1).join(".");
-      const curr = pkgpartsCount[s] ?? 0;
-      pkgpartsCount[s] = curr + 1;
+      const curr = pkgpartsCount.get(s) ?? 0;
+      pkgpartsCount.set(s, curr + 1);
     }
   }
-  let bestp = "";
-  let bestc = -Infinity;
-  for (let [p, c] of Object.entries(pkgpartsCount)) {
-    if (c < bestc) {
-      continue;
+  const pkgs = [...pkgpartsCount.entries()];
+  pkgs.sort((a, b) => {
+    const [apkg, acount] = a;
+    const [bpkg, bcount] = b;
+    if (acount > bcount) {
+      return -1;
+    } else if (bcount > acount) {
+      return 1;
+    } else {
+      const adots = countDots(apkg);
+      const bdots = countDots(bpkg);
+      if (adots > bdots) {
+        return -1;
+      } else if (bdots > adots) {
+        return 1;
+      } else {
+        return 0;
+      }
     }
-    if (bestp.length > p) {
-      continue;
-    }
-    bestp = p;
-    bestc = c;
+  });
+  const [result] = pkgs[0];
+  if (!result) {
+    throw new Error(
+      "unable to determine suitable basename for output files (use `basename` option?)"
+    );
   }
-  return bestp;
+  return result;
 }
+
+/**
+ * @typedef GenOptions
+ * @property {boolean} emitTypes
+ * @property {"es6"|"commonjs"} moduleSystem
+ * @property {Set<"client"|"server"|"proto">} gen
+ */
 
 /**
  * @param {google.protobuf.compiler.CodeGeneratorRequest} request
@@ -353,9 +545,11 @@ async function main(request) {
     .map((p) => p.split("="))
     .reduce((p, c) => ({ ...p, [c[0]]: c[1] }), {});
 
+  /** @type {GenOptions} */
   const options = {
     emitTypes: !parameters["no_emit_types"],
     moduleSystem: parameters["module"] ?? "es6",
+    gen: new Set((parameters["gen"] ?? "proto;server;client").split(";")),
   };
   if (["es6", "commonjs"].includes(options.moduleSystem) === false) {
     throw new Error(
@@ -364,70 +558,54 @@ async function main(request) {
   }
 
   await debug("params", { parameters });
-
-  const [outputName, dtsOutputName, protoFiles] = (() => {
-    if (parameters["pb_js_name"]) {
-      return [
-        `${parameters["pb_js_name"]}.pb.js`,
-        `${parameters["pb_js_name"]}.pb.d.ts`,
-        request.file_to_generate,
-      ];
-    }
-    if (request.file_to_generate.length > 1) {
-      const p = commonPackagePrefix(request);
-      return [`${p}.pb.js`, `${p}.pb.d.ts`, request.file_to_generate];
-    } else {
-      const protoFile = request.file_to_generate[0];
-      const pbjsFileName = protoFile.replace(/\.proto$/i, ".pb.js");
-      const pbtsFileName = protoFile.replace(/\.proto$/i, ".pb.d.ts");
-      return [pbjsFileName, pbtsFileName, request.file_to_generate];
-    }
-  })();
+  const basename = parameters["basename"] ?? commonPackagePrefix(request);
 
   /** @type {google.protobuf.compiler.CodeGeneratorResponse.File[]} */
   const files = [];
 
-  const pbjsFileContents = prettier.format(
-    await protobufjs([
-      "-t",
-      "static-module",
-      "-w",
-      options.moduleSystem,
-      "--es6",
-      "--no-service",
-      "--force-number",
-      "--force-message",
-      "--keep-case",
-      "--sparse",
-      ...protoFiles,
-    ]),
-    {
-      filepath: process.cwd(),
-      parser: "babel",
-    }
-  );
-
-  files.push({ name: outputName, content: pbjsFileContents });
-
-  if (options.emitTypes) {
-    // pbts only accepts files as an argument, so we have to write the pbjs file
-    // contents to a temporary file and
-    const pbtsFileContents = await tmpfile(async (path) => {
-      const jsPath = `${path}.js`;
-      await writeFile(jsPath, pbjsFileContents);
-      const pbtsContents = await protobufts([jsPath]);
-      return prettier.format(pbtsContents, {
+  if (options.gen.has("proto")) {
+    const pbjsFileContents = prettier.format(
+      await protobufjs([
+        "-t",
+        "static-module",
+        "-w",
+        options.moduleSystem,
+        "--es6",
+        "--no-service",
+        "--force-number",
+        "--force-message",
+        "--keep-case",
+        "--sparse",
+        ...request.file_to_generate,
+      ]),
+      {
         filepath: process.cwd(),
-        parser: "babel-ts",
+        parser: "babel",
+      }
+    );
+
+    files.push({ name: `${basename}.pb.js`, content: pbjsFileContents });
+
+    if (options.emitTypes) {
+      // pbts only accepts files as an argument, so we have to write the pbjs file
+      // contents to a temporary file and
+      const pbtsFileContents = await tmpfile(async (path) => {
+        const jsPath = `${path}.js`;
+        await writeFile(jsPath, pbjsFileContents);
+        const pbtsContents = await protobufts([jsPath]);
+        return prettier.format(pbtsContents, {
+          filepath: process.cwd(),
+          parser: "babel-ts",
+        });
       });
-    });
-    files.push({
-      name: dtsOutputName,
-      content: pbtsFileContents,
-    });
+      files.push({
+        name: `${basename}.pb.d.ts`,
+        content: pbtsFileContents,
+      });
+    }
   }
 
-  files.push(...(await genTwirpCFServer(request, outputName, options)));
+  files.push(...(await genTwirpCFServer(request, basename, options)));
 
   const response = google.protobuf.compiler.CodeGeneratorResponse.create({
     file: files,

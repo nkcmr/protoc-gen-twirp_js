@@ -35,6 +35,166 @@ export class TwirpError extends Error {
   }
 }
 
+type RawTwirpError = {
+  code: string;
+  msg: string;
+  meta?: Record<string, string>;
+};
+
+function isRawTwirpError(v?: any): v is RawTwirpError {
+  if (!v) {
+    return false;
+  }
+  if (typeof v !== "object") {
+    return false;
+  }
+  const presentKeys = new Set<string>(Object.keys(v));
+  const requiredKeys = new Set(["code", "msg"]);
+  const allowedKeys = new Set(["code", "msg", "meta"]);
+  const missingRequired = difference(requiredKeys, presentKeys);
+  if (missingRequired.size > 0) {
+    return false;
+  }
+  const extraKeys = difference(presentKeys, allowedKeys);
+  if (extraKeys.size > 0) {
+    return false;
+  }
+
+  if (typeof v["code"] !== "string") {
+    return false;
+  }
+  if (typeof v["msg"] !== "string") {
+    return false;
+  }
+  if (v["meta"]) {
+    if (typeof v["meta"] !== "object") {
+      return false;
+    }
+    for (let [mk, mv] of Object.entries(v["meta"])) {
+      if (typeof mk !== "string") {
+        return false;
+      }
+      if (typeof mv !== "string") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function difference<T = any>(setA: Set<T>, setB: Set<T>) {
+  let diff = new Set(setA);
+  for (let elem of setB) {
+    diff.delete(elem);
+  }
+  return diff;
+}
+
+const JSON_DECODE_FAILURE = Symbol("safeParseJSON.failure");
+
+function arrayBufferToString(data: ArrayBuffer): string {
+  const td = new TextDecoder();
+  return td.decode(data);
+}
+
+function safeParseJSON(data: ArrayBuffer): typeof JSON_DECODE_FAILURE | any {
+  try {
+    return JSON.parse(arrayBufferToString(data));
+  } catch {
+    return JSON_DECODE_FAILURE;
+  }
+}
+
+export function errorFromResponse(resp: Response, body: ArrayBuffer): never {
+  const statusCode = resp.status;
+  const statusText = resp.statusText;
+  if (isHTTPRedirect(statusCode)) {
+    const location = resp.headers.get("Location") ?? "";
+    const msg = `unexpected HTTP status code ${statusCode} ${statusText} received, Location=${location}`;
+    twirpErrorFromIntermediary(statusCode, msg, location);
+  }
+
+  const jsonBody = safeParseJSON(body);
+  if (!isRawTwirpError(jsonBody)) {
+    const msg = `Error from intermediary with HTTP status code ${statusCode} ${statusText}`;
+    twirpErrorFromIntermediary(statusCode, msg, arrayBufferToString(body));
+  }
+
+  if (serverHTTPStatusFromErrorCode(jsonBody.code as ErrorCode) === 0) {
+    const msg = `invalid type returned from server error response: ${jsonBody.code}`;
+    throw new TwirpError(ErrorCode.Internal, msg, {
+      body: arrayBufferToString(body),
+    });
+  }
+
+  throw new TwirpError(jsonBody.code as ErrorCode, jsonBody.msg, jsonBody.meta);
+}
+
+// twirpErrorFromIntermediary maps HTTP errors from non-twirp sources to twirp errors.
+// The mapping is similar to gRPC: https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md.
+// Returned twirp Errors have some additional metadata for inspection.
+function twirpErrorFromIntermediary(
+  status: number,
+  msg: string,
+  bodyOrLocation: string
+): never {
+  var code: ErrorCode;
+  if (isHTTPRedirect(status)) {
+    // 3xx
+    code = ErrorCode.Internal;
+  } else {
+    switch (status) {
+      case 400: // Bad Request
+        code = ErrorCode.Internal;
+        break;
+      case 401: // Unauthorized
+        code = ErrorCode.Unauthenticated;
+        break;
+      case 403: // Forbidden
+        code = ErrorCode.PermissionDenied;
+        break;
+      case 404: // Not Found
+        code = ErrorCode.BadRoute;
+        break;
+      case 429: // Too Many Requests
+        code = ErrorCode.ResourceExhausted;
+        break;
+
+      // Bad Gateway, Service Unavailable, Gateway Timeout
+      case 502:
+      case 503:
+      case 504:
+        code = ErrorCode.Unavailable;
+        break;
+      default:
+        // All other codes
+        code = ErrorCode.Unknown;
+        break;
+    }
+  }
+
+  const twerr = new TwirpError(code, msg, {
+    http_error_from_intermediary: "true",
+    status_code: status.toString(),
+  });
+  if (isHTTPRedirect(status)) {
+    throw twerr.withMeta("location", bodyOrLocation);
+  } else {
+    throw twerr.withMeta("body", bodyOrLocation);
+  }
+}
+
+function isHTTPRedirect(status: number): boolean {
+  return status >= 300 && status <= 399;
+}
+
+export type TwirpRequestOptions = {
+  contentType: ContentType;
+  fetcher?: typeof fetch;
+  prefix?: string;
+  endpoint?: string; // https://example.com
+};
+
 export type RequestDetails = {
   headers: Headers;
 };
@@ -47,6 +207,28 @@ export function setRequestDetails(request: object, details: RequestDetails) {
 
 export function getRequestDetails(request: object): RequestDetails | undefined {
   return requestInfo.get(request);
+}
+
+const responseHeaders = new WeakMap<object, Headers>();
+
+/**
+ * setResponseHeaders allow for business-logic code to modify response HTTP
+ * headers. Wrapping the return with this call will suffice:
+ *
+ * return setResponseHeaders(my.protobuf.create({ ... }), {"Set-Cookie": "..."})
+ */
+export function setResponseHeaders<T extends object>(
+  response: T,
+  headers: HeadersInit
+): T {
+  responseHeaders.set(response, new Headers(headers));
+  return response;
+}
+
+function getResponseHeaders<T extends object>(
+  response: T
+): Headers | undefined {
+  return responseHeaders.get(response);
 }
 
 /**
@@ -105,6 +287,26 @@ export interface IProtobufClass<T> {
 
 type ContentType = "application/json" | "application/protobuf";
 
+export function decodeResponse<T extends object>(
+  contentType: ContentType,
+  response: ArrayBuffer,
+  responseClass: IProtobufClass<T>
+): T {
+  switch (contentType) {
+    case "application/json":
+      const rawJson = safeParseJSON(response);
+      if (rawJson === JSON_DECODE_FAILURE) {
+        throw new TwirpError(
+          ErrorCode.Malformed,
+          "failed to parse json response"
+        );
+      }
+      return responseClass.fromObject(rawJson);
+    case "application/protobuf":
+      return responseClass.decode(new Uint8Array(response));
+  }
+}
+
 export async function decodeRequest<T = unknown>(
   request: Request,
   requestClass: IProtobufClass<T>
@@ -143,36 +345,55 @@ export async function decodeRequest<T = unknown>(
   );
 }
 
-/**
- * @param {string} contentType
- * @param {*} response
- * @param {*} responseClass
- * @returns {Response}
- */
-export function encodeResponse<T = unknown>(
+export function encodeRequest<T extends object>(
+  contentType: ContentType,
+  request: T,
+  requestClass: IProtobufClass<T>
+): [BodyInit, Headers] {
+  switch (contentType) {
+    case "application/json":
+      const requestStr = JSON.stringify(requestClass.toObject(request));
+      return [
+        requestStr,
+        new Headers({
+          "Content-Type": contentType,
+          "Content-Length": requestStr.length.toString(),
+        }),
+      ];
+    case "application/protobuf":
+      const requestUint8Arr = requestClass.encode(request).finish();
+      return [
+        requestUint8Arr,
+        new Headers({
+          "Content-Type": contentType,
+          "Content-Length": requestUint8Arr.byteLength.toString(),
+        }),
+      ];
+  }
+}
+
+export function encodeResponse<T extends object>(
   contentType: ContentType,
   response: T,
   responseClass: IProtobufClass<T>
 ): Response {
+  const headers = getResponseHeaders(response) ?? new Headers();
   switch (contentType) {
     case "application/json":
       const responseStr = JSON.stringify(responseClass.toObject(response));
+      headers.set("Content-Type", "application/json");
+      headers.set("Content-Length", responseStr.length.toString());
       return new Response(responseStr, {
         status: 200,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": responseStr.length.toString(),
-        },
+        headers: headers,
       });
     case "application/protobuf":
-      /** @type {Uint8Array} responseUint8Arr */
       const responseUint8Arr = responseClass.encode(response).finish();
+      headers.set("Content-Type", "application/json");
+      headers.set("Content-Length", responseUint8Arr.byteLength.toString());
       return new Response(responseUint8Arr, {
         status: 200,
-        headers: {
-          "Content-Type": "application/protobuf",
-          "Content-Length": responseUint8Arr.byteLength.toString(),
-        },
+        headers: headers,
       });
   }
 }
