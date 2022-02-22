@@ -1,6 +1,6 @@
 {
   "name": "@nkcmr/protoc-gen-twirp_js",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "",
   "private": false,
   "main": "dist/index.js",
@@ -13,6 +13,7 @@
   },
   "author": "nick comer (@nkcmr)",
   "dependencies": {
+    "globalthis": "^1.0.2",
     "google-proto-files": "^2.5.0",
     "prettier": "^2.5.1",
     "protobufjs": "^6.11.2",

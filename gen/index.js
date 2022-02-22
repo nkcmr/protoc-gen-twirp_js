@@ -103,11 +103,31 @@ function protobufts(args) {
 
 /**
  * @extends {Array<string>}
+ * @property {Map<string, Set<string>} imports
  */
 class SourceCode extends Array {
   constructor(...args) {
     super(...args);
+
+    /**
+     * @type {number}
+     * @private
+     */
     this.level = 0;
+
+    /**
+     * @type {Map<string, Set<string>>}
+     * @private
+     * @readonly
+     */
+    this.imports = new Map();
+
+    /**
+     * @type {Map<string, string>}
+     * @private
+     * @readonly
+     */
+    this.defaultImports = new Map();
   }
   /**
    * @param {number} level
@@ -130,6 +150,40 @@ class SourceCode extends Array {
     }
   }
 
+  /**
+   * @param {string} symbol
+   * @param {string} from
+   * @returns {string}
+   */
+  importDefault(symbol, from) {
+    const importSymbol = symbol.split(".").shift();
+    if (!this.defaultImports.has(from)) {
+      this.defaultImports.set(from, importSymbol);
+    } else {
+      if (this.defaultImports.get(from) !== importSymbol) {
+        throw new Error(
+          `conflicting import symbols for default export of ${from}`
+        );
+      }
+    }
+    return symbol;
+  }
+
+  /**
+   * @param {string} symbol
+   * @param {string} from
+   * @returns {string}
+   */
+  import(symbol, from) {
+    const importSymbol = symbol.split(".").shift();
+    if (!this.imports.has(from)) {
+      this.imports.set(from, new Set([importSymbol]));
+    } else {
+      this.imports.get(from).add(importSymbol);
+    }
+    return symbol;
+  }
+
   tryCatch({ tryBlock, catchBlock, finallyBlock }) {
     this.push(`try {`);
     this.write(tryBlock);
@@ -140,6 +194,30 @@ class SourceCode extends Array {
       this.write(finallyBlock);
     }
     this.push(`}`);
+  }
+
+  /**
+   * @param {"es6"|"commonjs"} moduleSystem
+   * @returns {string}
+   */
+  finish(moduleSystem) {
+    const imports = [];
+    for (let [path, sym] of this.defaultImports.entries()) {
+      if (moduleSystem === "es6") {
+        imports.push(`import * as ${sym} from '${path}';`);
+      } else if (moduleSystem === "commonjs") {
+        imports.push(`const ${sym} = require('${path}')`);
+      }
+    }
+    for (let [path, sym] of this.imports.entries()) {
+      if (moduleSystem === "es6") {
+        imports.push(`import { ${[...sym].join(", ")} } from '${path}';`);
+      } else if (moduleSystem === "commonjs") {
+        imports.push(`const { ${[...sym].join(", ")} } = require('${path}')`);
+      }
+    }
+    imports.push("");
+    return [...imports, ...this, ""].join("\n");
   }
 }
 
@@ -185,53 +263,10 @@ async function genTwirpCFServer(request, basename, options) {
     }
   }
 
+  // imports
+  const thisPackage = "@nkcmr/protoc-gen-twirp_js";
   const sc = new SourceCode();
   const typeSc = new SourceCode();
-  const runtimeImports = [
-    "badRouteError",
-    "parseTwirpPath",
-    "decodeRequest",
-    "setRequestDetails",
-    "encodeResponse",
-    "writeTwirpError",
-    "encodeRequest",
-    "errorFromResponse",
-    "decodeResponse",
-    "TwirpRequestOptions",
-  ].join(", ");
-  if (options.moduleSystem === "commonjs") {
-    const importPb = `const { ${[...rootsToImport.values()].join(
-      ", "
-    )} } = require('./${basename}.pb');`;
-    sc.push(
-      importPb,
-      `const { ${runtimeImports} } = require('@nkcmr/protoc-gen-twirp_js');`,
-      ""
-    );
-    typeSc.push(importPb);
-    if (options.gen.has("client")) {
-      typeSc.push(
-        `const { TwirpRequestOptions } = require('@nkcmr/protoc-gen-twirp_js')`
-      );
-    }
-  } else if (options.moduleSystem === "es6") {
-    const importPb = `import { ${[...rootsToImport.values()].join(
-      ", "
-    )} } from './${basename}.pb';`;
-    sc.push(
-      importPb,
-      `import { ${runtimeImports} } from '@nkcmr/protoc-gen-twirp_js';`,
-      ""
-    );
-    typeSc.push(importPb);
-    if (options.gen.has("client")) {
-      typeSc.push(
-        `import { TwirpRequestOptions } from '@nkcmr/protoc-gen-twirp_js'`
-      );
-    }
-  } else {
-    throw new Error(`unknown module system: ${options.moduleSystem}`);
-  }
 
   for (let pf of iterFtg(request)) {
     for (let svc of pf.service) {
@@ -242,10 +277,21 @@ async function genTwirpCFServer(request, basename, options) {
           ["Protobuf", "application/protobuf"],
         ]) {
           for (let m of svc.method) {
-            const input = m.input_type.slice(1);
-            const output = m.output_type.slice(1);
+            const input = typeSc.import(
+              m.input_type.slice(1),
+              `./${basename}.pb`
+            );
+            const output = typeSc.import(
+              m.output_type.slice(1),
+              `./${basename}.pb`
+            );
             typeSc.push(
-              `export function send${svc.name}${name}Request(method: "${m.name}", request: ${input}, options: Omit<TwirpRequestOptions, 'contentType'>): Promise<${output}>;`
+              `export function send${svc.name}${name}Request(method: "${
+                m.name
+              }", request: ${input}, options: Omit<${typeSc.import(
+                "TwirpRequestOptions",
+                thisPackage
+              )}, 'contentType'>): Promise<${output}>;`
             );
           }
         }
@@ -258,8 +304,14 @@ async function genTwirpCFServer(request, basename, options) {
           yield `prefix?: string;`;
         });
         for (let m of svc.method) {
-          const input = m.input_type.slice(1);
-          const output = m.output_type.slice(1);
+          const input = typeSc.import(
+            m.input_type.slice(1),
+            `./${basename}.pb`
+          );
+          const output = typeSc.import(
+            m.output_type.slice(1),
+            `./${basename}.pb`
+          );
           typeSc.write(function* () {
             yield `${m.name}(request: ${input}): Promise<${output}>`;
           });
@@ -271,7 +323,6 @@ async function genTwirpCFServer(request, basename, options) {
       }
     }
   }
-
   for (let pf of iterFtg(request)) {
     for (let svc of pf.service) {
       // client
@@ -289,7 +340,7 @@ async function genTwirpCFServer(request, basename, options) {
           yield `}`;
           yield `async function send${svc.name}Request(method, request, options) {`;
           sc.write(function* () {
-            yield "const path = `/${encodeURIComponent(options.prefix) || 'twirp'}/" +
+            yield "const path = `/${encodeURIComponent(options.prefix || 'twirp')}/" +
               pf.package +
               "." +
               svc.name +
@@ -305,38 +356,54 @@ async function genTwirpCFServer(request, basename, options) {
             });
             yield `}`;
             yield `/** @type {typeof fetch} */`;
-            yield `const fetcher = options.fetcher || globalThis.fetch;`;
+            yield `const fetcher = options.fetcher || ${sc.importDefault(
+              "globalThisPolyfill",
+              "globalthis"
+            )}().fetch;`;
             yield `switch (method) {`;
             sc.write(function* () {
               for (let i = 0; i < svc.method.length; i++) {
                 const m = svc.method[i];
-                const input = m.input_type.slice(1);
-                const output = m.output_type.slice(1);
+                const input = sc.import(
+                  m.input_type.slice(1),
+                  `./${basename}.pb`
+                );
+                const output = sc.import(
+                  m.output_type.slice(1),
+                  `./${basename}.pb`
+                );
                 yield `case "${m.name}":`;
                 sc.write(function* () {
-                  yield `const [body${i}, headers${i}] = encodeRequest(options.contentType, request, ${input})`;
+                  const encodeRequest = sc.import("encodeRequest", thisPackage);
+                  yield `const [body${i}, headers${i}] = ${encodeRequest}(options.contentType, request, ${input})`;
                   yield `headers${i}.set("Accept", options.contentType);`;
                   yield `headers${i}.set("Twirp-Version", "v8.1.1");`; // TODO: verify?
-                  yield `const req${i} = new Request(body${i}, {`;
+                  yield `const res${i} = await fetcher(u, {`;
                   sc.write(function* () {
-                    yield `url: u,`;
                     yield `method: "POST",`;
                     yield `headers: headers${i},`;
+                    yield `body: body${i},`;
                   });
                   yield `});`;
-                  yield `const res${i} = await fetcher(req${i})`;
                   yield `const resBody${i} = await res${i}.arrayBuffer();`;
                   yield `if (res${i}.status !== 200) {`;
                   sc.write(function* () {
-                    yield `errorFromResponse(res${i}, resBody${i});`;
+                    const errorFromResponse = sc.import(
+                      "errorFromResponse",
+                      thisPackage
+                    );
+                    yield `${errorFromResponse}(res${i}, resBody${i});`;
                   });
                   yield `}`;
-                  yield `return decodeResponse(options.contentType, resBody${i}, ${output})`;
+                  yield `return ${sc.import(
+                    "decodeResponse",
+                    thisPackage
+                  )}(options.contentType, resBody${i}, ${output})`;
                 });
               }
             });
             yield `}`;
-            yield "badRouteError(";
+            yield `${sc.import("badRouteError", thisPackage)}(`;
             sc.write(function* () {
               yield "`no handler for path ${path}`,";
               yield `"POST",`;
@@ -344,7 +411,6 @@ async function genTwirpCFServer(request, basename, options) {
             });
             yield `);`;
           });
-
           yield `}`;
         });
       }
@@ -359,7 +425,7 @@ async function genTwirpCFServer(request, basename, options) {
                 yield `const u = new URL(request.url);`;
                 yield `if (request.method !== "POST") {`;
                 sc.write(function* () {
-                  yield "badRouteError(";
+                  yield `${sc.import("badRouteError", thisPackage)}(`;
                   sc.write(function* () {
                     yield "`unsupported method ${request.method} (only POST is allowed)`,";
                     yield `request.method,`;
@@ -369,10 +435,13 @@ async function genTwirpCFServer(request, basename, options) {
                 });
                 yield `}`;
                 yield "// Verify path format: [<prefix>]/<package>.<Service>/<Method>";
-                yield `const [prefix, pkgService, method] = parseTwirpPath(u.pathname);`;
+                yield `const [prefix, pkgService, method] = ${sc.import(
+                  "parseTwirpPath",
+                  thisPackage
+                )}(u.pathname);`;
                 yield `if (pkgService !== "${pf.package}.${svc.name}") {`;
                 sc.write(function* () {
-                  yield "badRouteError(";
+                  yield `${sc.import("badRouteError", thisPackage)}(`;
                   sc.write(function* () {
                     yield "`no handler for path ${u.pathname}`,";
                     yield `request.method,`;
@@ -384,7 +453,7 @@ async function genTwirpCFServer(request, basename, options) {
                 yield `const expPrefix = handler.prefix || "twirp";`;
                 yield `if (prefix !== expPrefix) {`;
                 sc.write(function* () {
-                  yield "badRouteError(";
+                  yield `${sc.import("badRouteError", thisPackage)}(`;
                   sc.write(function* () {
                     yield "`invalid path prefix ${prefix}, expected ${expPrefix}, on path ${u.pathname}`,";
                     yield `request.method,`;
@@ -397,27 +466,36 @@ async function genTwirpCFServer(request, basename, options) {
                 yield `switch (method) {`;
                 for (let i = 0; i < svc.method.length; i++) {
                   const m = svc.method[i];
-                  const input = m.input_type.slice(1);
-                  const output = m.output_type.slice(1);
+                  const input = sc.import(
+                    m.input_type.slice(1),
+                    `./${basename}.pb`
+                  );
+                  const output = sc.import(
+                    m.output_type.slice(1),
+                    `./${basename}.pb`
+                  );
                   sc.write(function* () {
                     yield `case "${m.name}":`;
                     sc.write(function* () {
-                      yield `const [request${i}, ct${i}] = await decodeRequest(request, ${input})`;
-                      yield `setRequestDetails(request${i}, {`;
+                      yield `const [request${i}, ct${i}] = await ${sc.import("decodeRequest", thisPackage)}(request, ${input})`;
+                      yield `${sc.import(
+                        "setRequestDetails",
+                        thisPackage
+                      )}(request${i}, {`;
                       sc.write(function* () {
                         yield `headers: request.headers,`;
                       });
                       yield `});`;
-                      yield `/** @type {${m.output_type.slice(
-                        1
-                      )}} response${i} */`;
                       yield `const response${i} = await handler.${m.name}(request${i});`;
-                      yield `return encodeResponse(ct${i}, response${i}, ${output})`;
+                      yield `return ${sc.import(
+                        "encodeResponse",
+                        thisPackage
+                      )}(ct${i}, response${i}, ${output})`;
                     });
                   });
                 }
                 yield `}`;
-                yield "badRouteError(";
+                yield `${sc.import("badRouteError", thisPackage)}(`;
                 sc.write(function* () {
                   yield "`no handler for path ${u.pathname}`,";
                   yield `request.method,`;
@@ -426,7 +504,10 @@ async function genTwirpCFServer(request, basename, options) {
                 yield `);`;
               },
               *catchBlock(eIdent) {
-                yield `return writeTwirpError(${eIdent})`;
+                yield `return ${sc.import(
+                  "writeTwirpError",
+                  thisPackage
+                )}(${eIdent})`;
               },
             });
           });
@@ -437,7 +518,7 @@ async function genTwirpCFServer(request, basename, options) {
   }
   const twirpJSFile = {
     name: `${basename}.twirp.js`,
-    content: prettier.format([...sc, ""].join("\n"), {
+    content: prettier.format(sc.finish(options.moduleSystem), {
       filepath: process.cwd(),
       parser: "babel",
     }),
@@ -449,7 +530,7 @@ async function genTwirpCFServer(request, basename, options) {
     twirpJSFile,
     {
       name: `${basename}.twirp.d.ts`,
-      content: prettier.format([...typeSc, ""].join("\n"), {
+      content: prettier.format(typeSc.finish(options.moduleSystem), {
         filepath: process.cwd(),
         parser: "babel-ts",
       }),
