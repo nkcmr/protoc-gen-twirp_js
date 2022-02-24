@@ -389,7 +389,7 @@ export function encodeResponse<T extends object>(
       });
     case "application/protobuf":
       const responseUint8Arr = responseClass.encode(response).finish();
-      headers.set("Content-Type", "application/json");
+      headers.set("Content-Type", "application/protobuf");
       headers.set("Content-Length", responseUint8Arr.byteLength.toString());
       return new Response(responseUint8Arr, {
         status: 200,
