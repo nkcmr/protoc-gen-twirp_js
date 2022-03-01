@@ -1,0 +1,27 @@
+syntax = "proto3"; // required
+
+package strings.reverser; // not required but good to use
+
+// google defines a number of "utility" protobufs for things
+// like timestamp and other things.
+import "google/protobuf/timestamp.proto";
+
+// StringReverseRequest represents the "input" of a particular
+// method on your service (defined below).
+message StringReverseRequest {
+	string user_string = 1;
+}
+
+// StringReverseResponse would be the response. Notice the
+// convention of `${MethodName}Request` and
+// `${MethodName}Response`.
+message StringReverseResponse {
+  string reversed_string = 1;
+  google.protobuf.Timestamp reversed_at = 2;
+}
+
+// Reverser here is the actual "server" being defined in
+// by listing all of the methods or endpoints it has.
+service Reverser {
+  rpc StringReverse(StringReverseRequest) returns (StringReverseResponse);
+}

@@ -4,3 +4,4 @@ makefile
 tsconfig.json
 test/
 .vscode/
+example/
